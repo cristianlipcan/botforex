@@ -1,0 +1,14 @@
+# core
+requests
+pandas
+numpy
+python-telegram-bot==21.6
+scipy
+scikit-learn
+
+# smart-money-concepts is on PyPI
+smartmoneyconcepts
+
+# optional libs (install from GitHub) — păstrează comentate dacă nu vrei acum
+git+https://github.com/day0market/support_resistance.git#egg=support_resistance
+git+https://github.com/ednunezg/pytrendline.git#egg=pytrendline
