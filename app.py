@@ -10,19 +10,19 @@ from datetime import datetime, timezone
 from telegram import Bot
 
 # -------- CONFIG (mediu) --------
-ALPHA_KEY = os.getenv("ALPHAVANTAGE_KEY")    # required
+ABSTRACTAPI_KEY = os.getenv("ABSTRACTAPI_KEY")   # required
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 PAIRS = os.getenv("PAIRS", "EURUSD,GBPUSD,USDJPY").split(",")
-TF = os.getenv("TF", "5min")                 # AlphaVantage intervals: 1min,5min,15min...
+TF = os.getenv("TF", "5min")                 # AbstractAPI intervals: 1min, 5min, 15min...
 POLL_SEC = int(os.getenv("POLL_SEC", "60"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "60"))
 LOOKBACK = int(os.getenv("LOOKBACK", "200"))
-AV_RATE_LIMIT_SEC = 12   # AlphaVantage free rate ~5 req/min => ~12s between calls
+API_RATE_LIMIT_SEC = 12   # free AbstractAPI rate: ~5 req/min => ~12s
 
 # basic checks
-if not ALPHA_KEY:
-    raise ValueError("Setează ALPHAVANTAGE_KEY în variabilele de mediu.")
+if not ABSTRACTAPI_KEY:
+    raise ValueError("Setează ABSTRACTAPI_KEY în variabilele de mediu.")
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
     raise ValueError("Setează TELEGRAM_TOKEN și TELEGRAM_CHAT_ID în variabilele de mediu.")
 
@@ -45,34 +45,37 @@ try:
 except Exception:
     pt = None
 
-# -------- AlphaVantage fetch for FX_INTRADAY --------
-def alpha_fetch_fx_intraday(from_symbol: str, to_symbol: str, interval: str = "5min", outputsize: str = "compact"):
-    url = "https://www.alphavantage.co/query"
-    params = {
-        "function": "FX_INTRADAY",
-        "from_symbol": from_symbol,
-        "to_symbol": to_symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": ALPHA_KEY,
-    }
-    r = requests.get(url, params=params, timeout=20)
-    if r.status_code != 200:
-        logging.warning("AlphaVantage HTTP %s", r.status_code)
+# -------- AbstractAPI fetch for Forex --------
+def abstract_fetch_fx_intraday(from_symbol: str, to_symbol: str, interval="5min"):
+    url = f"https://forex.abstractapi.com/v1/?api_key={ABSTRACTAPI_KEY}&base={from_symbol}&target={to_symbol}&interval={interval}"
+    try:
+        r = requests.get(url, timeout=20)
+        if r.status_code != 200:
+            logging.warning("AbstractAPI HTTP %s", r.status_code)
+            return None
+        j = r.json()
+        data = j.get("data", [])
+        if not data:
+            return None
+        df = pd.DataFrame(data)
+        df = df.rename(columns={
+            "open": "open",
+            "high": "high",
+            "low": "low",
+            "close": "close",
+            "timestamp": "time"
+        })
+        df["open"] = df["open"].astype(float)
+        df["high"] = df["high"].astype(float)
+        df["low"] = df["low"].astype(float)
+        df["close"] = df["close"].astype(float)
+        df["time"] = pd.to_datetime(df["time"])
+        df = df.set_index("time")
+        df = df.sort_index()
+        return df.tail(LOOKBACK)
+    except Exception as e:
+        logging.exception("AbstractAPI fetch error: %s", e)
         return None
-    j = r.json()
-    # find time series key
-    key = next((k for k in j.keys() if "Time Series" in k), None)
-    if not key:
-        logging.warning("AlphaVantage response unexpected (keys: %s)", list(j.keys())[:6])
-        return None
-    ts = j[key]
-    df = pd.DataFrame.from_dict(ts, orient="index")
-    df.columns = ["open", "high", "low", "close"]
-    df = df.astype(float)
-    df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
-    return df.tail(LOOKBACK)
 
 # -------- Fallback Support/Resistance (naive pivot clustering) --------
 def naive_pivot_s_r(df: pd.DataFrame, window=20, thresh=0.002):
@@ -80,8 +83,8 @@ def naive_pivot_s_r(df: pd.DataFrame, window=20, thresh=0.002):
     lows = df['low']
     piv_high_idx = highs[(highs == highs.rolling(window, center=True).max())].dropna().index
     piv_low_idx = lows[(lows == lows.rolling(window, center=True).min())].dropna().index
-    piv_highs = highs.loc[piv_high_idx].values if len(piv_high_idx)>0 else np.array([])
-    piv_lows = lows.loc[piv_low_idx].values if len(piv_low_idx)>0 else np.array([])
+    piv_highs = highs.loc[piv_high_idx].values if len(piv_high_idx) > 0 else np.array([])
+    piv_lows = lows.loc[piv_low_idx].values if len(piv_low_idx) > 0 else np.array([])
     zones = []
     for price in piv_highs:
         found = False
@@ -122,17 +125,12 @@ def simple_bos_detector(df: pd.DataFrame, lookback=50):
 
 # -------- SMC helpers using smartmoneyconcepts (if available) --------
 def smc_detect(df: pd.DataFrame):
-    """
-    Returns dict with keys: 'fvg', 'swing', 'bos', 'ob', 'liquidity' if smc present,
-    else None
-    """
     out = {}
     try:
         if smc is None:
             return None
-        # smc expects lowercase columns
         ohlc = df[['open','high','low','close']].copy()
-        fvg = smc.fvg(ohlc)                     # returns array-like with FVG flags
+        fvg = smc.fvg(ohlc)
         swings = smc.swing_highs_lows(ohlc, swing_length=50)
         bos = smc.bos_choch(ohlc, swings, close_break=True)
         ob = smc.ob(ohlc, swings, close_mitigation=False)
@@ -157,7 +155,6 @@ def score_trade(df_main: pd.DataFrame, df_confirm: pd.DataFrame, zones, bos_info
 
     # SMC bos_info preference
     if smc_info and 'bos' in smc_info and smc_info['bos'] is not None:
-        # smc returns arrays -> we'll do a simple score boost
         score += 25
         direction = trend
 
@@ -205,20 +202,17 @@ async def analyze_pair(pair: str, sem: asyncio.Semaphore, sent_signals: set):
     async with sem:
         from_sym = pair[:3]
         to_sym = pair[3:]
-        # fetch confirm timeframe df
-        df_confirm = alpha_fetch_fx_intraday(from_sym, to_sym, interval=TF)
+        df_confirm = abstract_fetch_fx_intraday(from_sym, to_sym, interval=TF)
         if df_confirm is None:
             logging.warning("[%s] no data", pair)
             return
-        # use same as main for trend — can change to larger TF
         df_main = df_confirm.copy()
 
-        # zones: try library first, fallback to naive
+        # zones
         zones = None
         if sr is not None:
             try:
-                # NOTE: API of support_resistance may differ; adapt if needed
-                zones = sr.find_support_resistance(df_confirm)  # pseudo-call (adjust if lib differs)
+                zones = sr.find_support_resistance(df_confirm)
             except Exception:
                 zones = naive_pivot_s_r(df_confirm)
         else:
@@ -262,7 +256,7 @@ async def main():
         tasks = []
         for p in PAIRS:
             tasks.append(analyze_pair(p.strip(), sem, sent_signals))
-            await asyncio.sleep(AV_RATE_LIMIT_SEC)  # throttle for AlphaVantage
+            await asyncio.sleep(API_RATE_LIMIT_SEC)
         await asyncio.gather(*tasks)
         elapsed = time.time() - start
         wait = max(1, POLL_SEC - elapsed)
