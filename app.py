@@ -12,12 +12,11 @@ from telegram import Bot
 ALPHA_KEY = os.getenv("ALPHAVANTAGE_KEY")    # API gratuit AlphaVantage
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-PAIRS = os.getenv("PAIRS", "EURUSD,GBPUSD,USDJPY").split(",")
+PAIRS = os.getenv("PAIRS", "EURUSD,GBPUSD,USDJPY,BTC/USD").split(",")
 TF = os.getenv("TF", "5min")
 POLL_SEC = int(os.getenv("POLL_SEC", "60"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "60"))
 LOOKBACK = int(os.getenv("LOOKBACK", "200"))
-AV_RATE_LIMIT_SEC = 12
 
 # Checks
 if not ALPHA_KEY:
@@ -62,8 +61,36 @@ def alpha_fetch_fx_intraday(from_symbol: str, to_symbol: str, interval: str = "5
     ts = j[key]
     df = pd.DataFrame.from_dict(ts, orient="index").astype(float)
     df.index = pd.to_datetime(df.index)
-    df = df.sort_index()
-    return df.tail(LOOKBACK)
+    return df.sort_index().tail(LOOKBACK)
+
+def alpha_fetch_crypto_intraday(symbol="BTC", market="USD", interval="5min"):
+    url = "https://www.alphavantage.co/query"
+    params = {
+        "function": "DIGITAL_CURRENCY_INTRADAY",
+        "symbol": symbol,
+        "market": market,
+        "interval": interval,
+        "apikey": ALPHA_KEY,
+    }
+    r = requests.get(url, params=params, timeout=20)
+    if r.status_code != 200:
+        logging.warning("AlphaVantage HTTP %s", r.status_code)
+        return None
+    j = r.json()
+    data_key = next((k for k in j.keys() if "Time Series" in k), None)
+    if not data_key:
+        logging.warning("AlphaVantage crypto response unexpected (keys: %s)", list(j.keys())[:6])
+        return None
+    df = pd.DataFrame(j[data_key]).T
+    df = df.rename(columns={
+        '1. open (USD)': 'open',
+        '2. high (USD)': 'high',
+        '3. low (USD)':  'low',
+        '4. close (USD)': 'close',
+        '5. volume': 'volume'
+    }).astype(float)
+    df.index = pd.to_datetime(df.index)
+    return df.sort_index().tail(LOOKBACK)
 
 # -------- Naive Support/Resistance --------
 def naive_pivot_s_r(df: pd.DataFrame, window=20, thresh=0.002):
@@ -171,14 +198,23 @@ async def send_telegram(msg: str):
     except Exception as e:
         logging.exception("Telegram error: %s", e)
 
-# -------- Analyze pair --------
+# -------- Analyze pair (FX + CRYPTO) --------
 async def analyze_pair(pair: str, sem: asyncio.Semaphore, sent_signals: set):
     async with sem:
-        from_sym, to_sym = pair[:3], pair[3:]
-        df_confirm = alpha_fetch_fx_intraday(from_sym, to_sym, interval=TF)
+        is_crypto = pair.upper() in ["BTC/USD", "BTC/USDT"]
+
+        if is_crypto:
+            df_confirm = alpha_fetch_crypto_intraday("BTC", "USD", interval=TF)
+            await asyncio.sleep(15)  # respect rate-limit crypto
+        else:
+            from_sym, to_sym = pair[:3], pair[3:]
+            df_confirm = alpha_fetch_fx_intraday(from_sym, to_sym, interval=TF)
+            await asyncio.sleep(12)  # respect rate-limit FX
+
         if df_confirm is None:
             logging.warning("[%s] no data", pair)
             return
+
         df_main = df_confirm.copy()
         zones = naive_pivot_s_r(df_confirm)
         smc_info = smc_detect(df_confirm)
@@ -207,8 +243,6 @@ async def main():
     while True:
         start = time.time()
         tasks = [analyze_pair(p.strip(), sem, sent_signals) for p in PAIRS]
-        for t in tasks:
-            await asyncio.sleep(AV_RATE_LIMIT_SEC)
         await asyncio.gather(*tasks)
         elapsed = time.time() - start
         wait = max(1, POLL_SEC - elapsed)
