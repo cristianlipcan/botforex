@@ -38,7 +38,7 @@ try:
 except:
     pt = None
 
-# -------- AlphaVantage fetch --------
+# -------- AlphaVantage FX fetch --------
 def alpha_fetch_fx_intraday(from_symbol: str, to_symbol: str, interval: str = "5min"):
     url = "https://www.alphavantage.co/query"
     params = {
@@ -63,6 +63,7 @@ def alpha_fetch_fx_intraday(from_symbol: str, to_symbol: str, interval: str = "5
     df.index = pd.to_datetime(df.index)
     return df.sort_index().tail(LOOKBACK)
 
+# -------- AlphaVantage CRYPTO fetch --------
 def alpha_fetch_crypto_intraday(symbol="BTC", market="USD", interval="5min"):
     url = "https://www.alphavantage.co/query"
     params = {
@@ -201,10 +202,12 @@ async def send_telegram(msg: str):
 # -------- Analyze pair (FX + CRYPTO) --------
 async def analyze_pair(pair: str, sem: asyncio.Semaphore, sent_signals: set):
     async with sem:
-        is_crypto = pair.upper() in ["BTC/USD", "BTC/USDT"]
+        pair = pair.upper().strip()
+        is_crypto = "BTC" in pair or "ETH" in pair  # aici poți extinde alte crypto
 
         if is_crypto:
-            df_confirm = alpha_fetch_crypto_intraday("BTC", "USD", interval=TF)
+            sym, market = pair.replace("/", "").split("/") if "/" in pair else ("BTC", "USD")
+            df_confirm = alpha_fetch_crypto_intraday(symbol=sym, market=market, interval=TF)
             await asyncio.sleep(15)  # respect rate-limit crypto
         else:
             from_sym, to_sym = pair[:3], pair[3:]
